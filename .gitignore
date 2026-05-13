@@ -1,0 +1,14 @@
+node_modules/
+*.log
+server.log
+.env
+.env.local
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

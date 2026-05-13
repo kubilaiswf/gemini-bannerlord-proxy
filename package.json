@@ -1,0 +1,13 @@
+{
+  "name": "gemini-bannerlord-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ollama-compatible HTTP proxy that forwards Bannerlord AIInfluence mod requests to the Gemini CLI (Google account / Gemini subscription).",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
