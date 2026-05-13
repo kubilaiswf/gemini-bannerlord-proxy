@@ -8,6 +8,8 @@ const PORT = Number(process.env.PORT || 11434);
 const HOST = process.env.HOST || "127.0.0.1";
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || "flash";
 const REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 120_000);
+const POOL_SIZE_PER_MODEL = Math.max(0, Number(process.env.GEMINI_POOL_SIZE ?? 1));
+const POOL_MAX_AGE_MS = Number(process.env.GEMINI_POOL_MAX_AGE_MS ?? 5 * 60 * 1000);
 
 const MODEL_ALIASES = {
   flash: "gemini-2.5-flash-lite",
@@ -125,82 +127,148 @@ function splitMessages(messages) {
   };
 }
 
-function runGemini({ system, prompt, model }) {
-  return new Promise((resolve, reject) => {
-    const effectiveSystem = system && system.trim().length > 0
-      ? system
-      : "You are roleplaying inside a Mount and Blade: Bannerlord scene. Follow the instructions in the user message and respond directly in character. Do not mention being an AI, an assistant, tools, or coding. Reply only with the in-character text the game expects.";
+const DEFAULT_SYSTEM_PROMPT = "You are roleplaying inside a Mount and Blade: Bannerlord scene. Follow the instructions in the user message and respond directly in character. Do not mention being an AI, an assistant, tools, or coding. Reply only with the in-character text the game expects.";
 
-    // Gemini CLI has no --system-prompt flag in headless mode. Prepend the
-    // system text to the user prompt with a clear marker. Whole payload goes
-    // via stdin (-p "" triggers headless mode without putting the prompt on
-    // the command line, which would hit Windows' ~32 KB arg-length limit).
-    const stdinPayload = effectiveSystem + "\n\n---\n\n" + (prompt || "");
+// One gemini CLI process. We pre-spawn these into a per-model pool so the
+// Node-on-Node CLI boot (~2-5s) happens while the server is idle instead of
+// while the player is waiting for the NPC to talk. Each process is one-shot:
+// in headless `-p ""` mode the CLI exits after a single prompt, so after .use()
+// the process is dead and the pool refills with a fresh one.
+class WarmProcess {
+  constructor(model) {
+    this.model = model;
+    this.createdAt = Date.now();
+    this.taken = false;
+    this.dead = false;
+    this.stdout = "";
+    this.stderr = "";
+    this._spawn();
+  }
 
-    // --yolo auto-approves any tool call so the CLI never blocks on a
-    // confirmation prompt (NPC dialogue doesn't need tools, but the model may
-    // still attempt one — we just want it not to hang).
+  _spawn() {
     const cliArgs = [
       "-p", "",
       "--output-format", "json",
-      "--model", model,
+      "--model", this.model,
       "--yolo",
     ];
 
     // In shell:true mode, cmd.exe collapses bare empty-string args, which
     // would turn `-p ""` into `-p` (no value) and break headless mode.
-    // Replace empties with explicit literal "".
     const useShell = GEMINI_LAUNCHER.shell === true;
     const spawnArgs = useShell
       ? [...GEMINI_LAUNCHER.baseArgs, ...cliArgs].map((a) => a === "" ? '""' : a)
       : [...GEMINI_LAUNCHER.baseArgs, ...cliArgs];
 
-    const child = spawn(GEMINI_LAUNCHER.cmd, spawnArgs, {
+    this.child = spawn(GEMINI_LAUNCHER.cmd, spawnArgs, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: useShell,
       windowsHide: true,
     });
 
-    let stdout = "";
-    let stderr = "";
-    let killed = false;
+    this.child.stdout.on("data", (c) => { this.stdout += c.toString("utf8"); });
+    this.child.stderr.on("data", (c) => { this.stderr += c.toString("utf8"); });
 
+    this.exitPromise = new Promise((resolve) => {
+      this.child.once("close", (code) => { this.dead = true; resolve(code); });
+      this.child.once("error", () => { this.dead = true; resolve(-1); });
+    });
+  }
+
+  isFresh() {
+    return !this.dead && !this.taken && (Date.now() - this.createdAt) < POOL_MAX_AGE_MS;
+  }
+
+  async use(stdinPayload, timeoutMs) {
+    this.taken = true;
+    if (this.dead) {
+      throw new Error(`warm process died before use: ${this.stderr.trim() || "no stderr"}`);
+    }
+
+    let timedOut = false;
     const timer = setTimeout(() => {
-      killed = true;
-      child.kill("SIGKILL");
-      reject(new Error(`gemini CLI timed out after ${REQUEST_TIMEOUT_MS}ms`));
-    }, REQUEST_TIMEOUT_MS);
+      timedOut = true;
+      try { this.child.kill("SIGKILL"); } catch {}
+    }, timeoutMs);
 
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+    this.child.stdin.end(stdinPayload, "utf8");
+    const code = await this.exitPromise;
+    clearTimeout(timer);
 
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
+    if (timedOut) throw new Error(`gemini CLI timed out after ${timeoutMs}ms`);
+    if (code !== 0) {
+      throw new Error(`gemini exited ${code}: ${this.stderr.trim() || this.stdout.trim()}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(this.stdout);
+    } catch (err) {
+      throw new Error(`failed to parse gemini output: ${err.message}\nstdout: ${this.stdout.slice(0, 500)}`);
+    }
+    if (parsed.error) {
+      throw new Error(`gemini error: ${parsed.error.message || JSON.stringify(parsed.error)}`);
+    }
+    const text = typeof parsed.response === "string" ? parsed.response : "";
+    return { text: String(text).trim(), raw: parsed };
+  }
 
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killed) return;
-      if (code !== 0) {
-        reject(new Error(`gemini exited ${code}: ${stderr.trim() || stdout.trim()}`));
-        return;
-      }
-      try {
-        const parsed = JSON.parse(stdout);
-        if (parsed.error) {
-          reject(new Error(`gemini error: ${parsed.error.message || JSON.stringify(parsed.error)}`));
-          return;
-        }
-        const text = typeof parsed.response === "string" ? parsed.response : "";
-        resolve({ text: String(text).trim(), raw: parsed });
-      } catch (err) {
-        reject(new Error(`failed to parse gemini output: ${err.message}\nstdout: ${stdout.slice(0, 500)}`));
-      }
-    });
+  kill() {
+    try { this.child.kill("SIGKILL"); } catch {}
+  }
+}
 
-    child.stdin.end(stdinPayload, "utf8");
-  });
+const warmPools = new Map(); // resolved model id -> WarmProcess[]
+
+function ensureWarmPool(model) {
+  if (POOL_SIZE_PER_MODEL <= 0) return;
+  let pool = warmPools.get(model);
+  if (!pool) { pool = []; warmPools.set(model, pool); }
+  // Drop stale/dead processes
+  for (let i = pool.length - 1; i >= 0; i--) {
+    if (!pool[i].isFresh()) { pool[i].kill(); pool.splice(i, 1); }
+  }
+  while (pool.length < POOL_SIZE_PER_MODEL) {
+    pool.push(new WarmProcess(model));
+  }
+}
+
+function takeFromPool(model) {
+  // Schedule a refill regardless of outcome — that way a never-seen-before
+  // model also gets warmed for its next request, not just the next-next one.
+  setImmediate(() => ensureWarmPool(model));
+  const pool = warmPools.get(model);
+  if (!pool) return null;
+  while (pool.length > 0) {
+    const w = pool.shift();
+    if (w.isFresh()) return w;
+    w.kill();
+  }
+  return null;
+}
+
+async function runGemini({ system, prompt, model }) {
+  const effectiveSystem = system && system.trim().length > 0 ? system : DEFAULT_SYSTEM_PROMPT;
+  // Gemini CLI has no --system-prompt flag in headless mode. Prepend the
+  // system text to the user prompt with a clear marker. Whole payload goes
+  // via stdin (-p "" triggers headless mode without putting the prompt on
+  // the command line, which would hit Windows' ~32 KB arg-length limit).
+  const stdinPayload = effectiveSystem + "\n\n---\n\n" + (prompt || "");
+
+  let proc = takeFromPool(model);
+  const usedWarm = !!proc;
+  if (!proc) proc = new WarmProcess(model);
+
+  try {
+    return await proc.use(stdinPayload, REQUEST_TIMEOUT_MS);
+  } catch (err) {
+    // A warm process may die between spawn and use (auth lapse, stale state).
+    // Retry once with a fresh cold spawn so a transient pool failure doesn't
+    // surface to the player as a CLI error.
+    if (!usedWarm) throw err;
+    console.warn("  ~~ warm process failed, retrying cold:", err.message);
+    const fresh = new WarmProcess(model);
+    return await fresh.use(stdinPayload, REQUEST_TIMEOUT_MS);
+  }
 }
 
 app.get("/", (_req, res) => {
@@ -366,6 +434,7 @@ app.listen(PORT, HOST, () => {
   console.log(` Listening on  http://${HOST}:${PORT}`);
   console.log(` Gemini bin    ${GEMINI_LAUNCHER.cmd} ${GEMINI_LAUNCHER.baseArgs.join(" ")}`);
   console.log(` Default model ${DEFAULT_MODEL} (${MODEL_ALIASES[DEFAULT_MODEL] || DEFAULT_MODEL})`);
+  console.log(` Warm pool     ${POOL_SIZE_PER_MODEL} per model (set GEMINI_POOL_SIZE=0 to disable)`);
   console.log("");
   console.log(" In Bannerlord MCM > AIInfluence:");
   console.log("   Provider     = Ollama");
@@ -376,4 +445,18 @@ app.listen(PORT, HOST, () => {
   console.log("");
   console.log(" Logs from each request appear below. Ctrl+C to stop.");
   console.log("-----------------------------------------------------");
+
+  // Pre-warm the default model so the very first request also skips the
+  // ~2-5s CLI cold start. Other models get warmed on first use.
+  const defaultGeminiModel = MODEL_ALIASES[DEFAULT_MODEL] || DEFAULT_MODEL;
+  ensureWarmPool(defaultGeminiModel);
 });
+
+function shutdown() {
+  for (const pool of warmPools.values()) {
+    for (const w of pool) w.kill();
+  }
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
