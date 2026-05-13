@@ -16,27 +16,63 @@ const MODEL_ALIASES = {
 };
 
 function resolveGeminiLauncher() {
+  // 1. Explicit override
   if (process.env.GEMINI_CLI_JS && fs.existsSync(process.env.GEMINI_CLI_JS)) {
-    return { cmd: process.execPath, baseArgs: [process.env.GEMINI_CLI_JS] };
+    return { cmd: process.execPath, baseArgs: [process.env.GEMINI_CLI_JS], shell: false };
   }
+
   if (os.platform() === "win32") {
-    const candidates = [
-      path.join(process.env.APPDATA || "", "npm", "node_modules", "@google", "gemini-cli", "dist", "index.js"),
-      path.join(os.homedir(), "AppData", "Roaming", "npm", "node_modules", "@google", "gemini-cli", "dist", "index.js"),
-    ];
-    for (const c of candidates) {
-      if (fs.existsSync(c)) return { cmd: process.execPath, baseArgs: [c] };
-    }
+    // 2. Read the .cmd shim and parse the real JS/EXE target out of it. This
+    // is the most reliable method because it works for non-standard npm
+    // prefixes (nvm-windows, scoop, custom --prefix, etc.).
     try {
       const where = spawnSync("where", ["gemini.cmd"], { encoding: "utf8" });
       const line = where.stdout.split(/\r?\n/).find((l) => l.trim().endsWith(".cmd"));
       if (line) {
-        const guess = path.join(path.dirname(line.trim()), "node_modules", "@google", "gemini-cli", "dist", "index.js");
-        if (fs.existsSync(guess)) return { cmd: process.execPath, baseArgs: [guess] };
+        const cmdPath = line.trim();
+        const cmdDir = path.dirname(cmdPath);
+        const contents = fs.readFileSync(cmdPath, "utf8");
+        // Pull out every quoted path-with-extension that mentions node_modules
+        // (skips the node.exe self-reference in npm-generated shims). Expand
+        // %dp0% / %~dp0 to the shim's directory.
+        const matches = [...contents.matchAll(/"([^"]+node_modules[^"]+\.(?:js|exe))"/gi)];
+        for (const m of matches) {
+          const resolved = m[1].replace(/%~?dp0%\\?/gi, cmdDir + path.sep);
+          if (fs.existsSync(resolved)) {
+            if (resolved.toLowerCase().endsWith(".js")) {
+              return { cmd: process.execPath, baseArgs: [resolved], shell: false };
+            }
+            return { cmd: resolved, baseArgs: [], shell: false };
+          }
+        }
+        // Couldn't extract a usable target from the shim. Spawn the .cmd via
+        // shell:true so cmd.exe handles it. Safe because our big payload
+        // (the prompt) goes via stdin, not as an argument.
+        return { cmd: `"${cmdPath}"`, baseArgs: [], shell: true };
       }
     } catch {}
+
+    // 3. Known static install paths as a fallback (npm default prefix).
+    const npmRoots = [
+      path.join(process.env.APPDATA || "", "npm", "node_modules", "@google", "gemini-cli"),
+      path.join(os.homedir(), "AppData", "Roaming", "npm", "node_modules", "@google", "gemini-cli"),
+    ];
+    for (const root of npmRoots) {
+      if (!fs.existsSync(root)) continue;
+      const jsCandidates = [
+        path.join(root, "dist", "index.js"),
+        path.join(root, "dist", "src", "gemini.js"),
+        path.join(root, "bin", "gemini.js"),
+        path.join(root, "index.js"),
+      ];
+      for (const p of jsCandidates) {
+        if (fs.existsSync(p)) return { cmd: process.execPath, baseArgs: [p], shell: false };
+      }
+    }
   }
-  return { cmd: "gemini", baseArgs: [] };
+
+  // 4. Last resort: hope `gemini` is in PATH and let the shell find it.
+  return { cmd: "gemini", baseArgs: [], shell: true };
 }
 
 const GEMINI_LAUNCHER = resolveGeminiLauncher();
@@ -111,9 +147,17 @@ function runGemini({ system, prompt, model }) {
       "--yolo",
     ];
 
-    const child = spawn(GEMINI_LAUNCHER.cmd, [...GEMINI_LAUNCHER.baseArgs, ...cliArgs], {
+    // In shell:true mode, cmd.exe collapses bare empty-string args, which
+    // would turn `-p ""` into `-p` (no value) and break headless mode.
+    // Replace empties with explicit literal "".
+    const useShell = GEMINI_LAUNCHER.shell === true;
+    const spawnArgs = useShell
+      ? [...GEMINI_LAUNCHER.baseArgs, ...cliArgs].map((a) => a === "" ? '""' : a)
+      : [...GEMINI_LAUNCHER.baseArgs, ...cliArgs];
+
+    const child = spawn(GEMINI_LAUNCHER.cmd, spawnArgs, {
       stdio: ["pipe", "pipe", "pipe"],
-      shell: false,
+      shell: useShell,
       windowsHide: true,
     });
 
